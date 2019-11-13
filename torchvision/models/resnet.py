@@ -31,6 +31,14 @@ def conv1x1(in_planes, out_planes, stride=1):
     """1x1 convolution"""
     return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
+class IdentityShortcut(torch.nn.Module):
+    """Shortcut by zero-padding to match the feature map dimensions"""
+    def __init__(self, stride, padding):
+        super(IdentityShortcut, self).__init__()
+        self.pad = padding
+        self.stride = stride
+    def forward(self, x):
+        return nn.functional.pad(x[:, :, ::self.stride, ::self.stride], (0, 0, 0, 0, self.pad, self.pad), "constant", 0)
 
 class BasicBlock(nn.Module):
     expansion = 1
@@ -119,40 +127,51 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
 
-    def __init__(self, block, layers, num_classes=1000, zero_init_residual=False,
-                 groups=1, width_per_group=64, replace_stride_with_dilation=None,
-                 norm_layer=None):
+    def __init__(self, block, layers, in_planes=64, num_classes=1000, zero_init_residual=False,
+                 groups=1, width_per_group=64, replace_stride_with_dilation=None, option='B',
+                 norm_layer=None, first_conv_params=None, use_maxpool=True):
         super(ResNet, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
-
-        self.inplanes = 64
+        self._use_maxpool = use_maxpool
+        self.option = option
         self.dilation = 1
+        self.in_planes = in_planes
+        if len(layers) <= 2 or len(layers) >= 5:
+            raise ValueError("Only 3 or 4 residual blocks are currently supported, got {}".format(layers))
         if replace_stride_with_dilation is None:
             # each element in the tuple indicates if we should replace
             # the 2x2 stride with a dilated convolution instead
-            replace_stride_with_dilation = [False, False, False]
-        if len(replace_stride_with_dilation) != 3:
+            replace_stride_with_dilation = (False,) * len(layers)
+        if len(replace_stride_with_dilation) != len(layers) - 1:
             raise ValueError("replace_stride_with_dilation should be None "
-                             "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
+                             "or a n-1 tuple with n is the number of blocks, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
-        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3,
-                               bias=False)
-        self.bn1 = norm_layer(self.inplanes)
+        if first_conv_params is None:
+            # Use standard Conv2d (7x7 with stride 2)
+            self.conv1 = nn.Conv2d(3, self.in_planes, kernel_size=7, stride=2, padding=3, bias=False)
+        else:
+            # Use custom Conv2d layer as a first layer (e.g. for narrow ResNet)
+            self.conv1 = nn.Conv2d(3, self.in_planes, bias=False, **first_conv_params)
+        self.bn1 = norm_layer(self.in_planes)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.layer1 = self._make_layer(block, 64, layers[0])
-        self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
+        if self._use_maxpool:
+            self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        # The number of planes doubles after every residual block
+        self.layer1 = self._make_layer(block, in_planes, layers[0])
+        self.layer2 = self._make_layer(block, in_planes * 2, layers[1], stride=2,
                                        dilate=replace_stride_with_dilation[0])
-        self.layer3 = self._make_layer(block, 256, layers[2], stride=2,
+        self.layer3 = self._make_layer(block, in_planes * 4, layers[2], stride=2,
                                        dilate=replace_stride_with_dilation[1])
-        self.layer4 = self._make_layer(block, 512, layers[3], stride=2,
-                                       dilate=replace_stride_with_dilation[2])
+        if len(layers) == 4:
+            self.layer4 = self._make_layer(block, in_planes * 8, layers[3], stride=2,
+                                           dilate=replace_stride_with_dilation[2])
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(512 * block.expansion, num_classes)
+        self.fc = nn.Linear(2**(len(layers)-1) * in_planes * block.expansion, num_classes)
 
+        # Kaiming initialization
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -177,18 +196,23 @@ class ResNet(nn.Module):
         if dilate:
             self.dilation *= stride
             stride = 1
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                norm_layer(planes * block.expansion),
-            )
+        if stride != 1 or self.in_planes != planes * block.expansion:
+            if self.option == 'A':
+                # Option A: identity shortcut with padding
+                downsample = IdentityShortcut(stride, (planes * block.expansion - self.in_planes) // 2)
+            elif self.option == 'B':
+                # Option B: use a 1x1 convolution to map the residual to the main branch
+                downsample = nn.Sequential(
+                    conv1x1(self.in_planes, planes * block.expansion, stride),
+                    norm_layer(planes * block.expansion),
+                )
 
         layers = []
-        layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
+        layers.append(block(self.in_planes, planes, stride, downsample, self.groups,
                             self.base_width, previous_dilation, norm_layer))
-        self.inplanes = planes * block.expansion
+        self.in_planes = planes * block.expansion
         for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes, groups=self.groups,
+            layers.append(block(self.in_planes, planes, groups=self.groups,
                                 base_width=self.base_width, dilation=self.dilation,
                                 norm_layer=norm_layer))
 
@@ -198,12 +222,14 @@ class ResNet(nn.Module):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
-        x = self.maxpool(x)
+        if self._use_maxpool:
+            x = self.maxpool(x)
 
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
-        x = self.layer4(x)
+        if hasattr(self, "layer4"):
+            x = self.layer4(x)
 
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
@@ -346,3 +372,27 @@ def wide_resnet101_2(pretrained=False, progress=True, **kwargs):
     kwargs['width_per_group'] = 64 * 2
     return _resnet('wide_resnet101_2', Bottleneck, [3, 4, 23, 3],
                    pretrained, progress, **kwargs)
+
+
+def narrow_resnet20(**kwargs):
+    return ResNet(BasicBlock, [3, 3, 3], in_planes=16, option='A', first_conv_params={'kernel_size': 3, 'stride': 1, 'padding': 1}, use_maxpool=False, **kwargs)
+
+
+def narrow_resnet32(**kwargs):
+    return ResNet(BasicBlock, [5, 5, 5], in_planes=16, option='A', first_conv_params={'kernel_size': 3, 'stride': 1, 'padding': 1}, use_maxpool=False, **kwargs)
+
+
+def narrow_resnet44(**kwargs):
+    return ResNet(BasicBlock, [7, 7, 7], in_planes=16, option='A', first_conv_params={'kernel_size': 3, 'stride': 1, 'padding': 1}, use_maxpool=False, **kwargs)
+
+
+def narrow_resnet56(**kwargs):
+    return ResNet(BasicBlock, [9, 9, 9], in_planes=16, option='A', first_conv_params={'kernel_size': 3, 'stride': 1, 'padding': 1}, use_maxpool=False, **kwargs)
+
+
+def narrow_resnet110(**kwargs):
+     return ResNet(BasicBlock, [18, 18, 18], in_planes=16, option='A', first_conv_params={'kernel_size': 3, 'stride': 1, 'padding': 1}, use_maxpool=False, **kwargs)
+
+
+def narrow_resnet1202(**kwargs):
+     return ResNet(BasicBlock, [200, 200, 200], in_planes=16, option='A', first_conv_params={'kernel_size': 3, 'stride': 1, 'padding': 1}, use_maxpool=False, **kwargs)
